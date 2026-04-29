@@ -1,0 +1,341 @@
+---
+title: Database
+description: Configure PostgreSQL, run migrations, and customize multi-tenancy. Use the DatabaseAdapter interface only if you're building a custom backend.
+icon: Database
+---
+
+Aphex ships with a PostgreSQL adapter built on [Drizzle ORM](https://orm.drizzle.team/). Most projects need to do nothing more than set `DATABASE_URL` and run `pnpm db:push`. The interface details at the bottom of this page are only relevant if you're writing a custom adapter for a non-Postgres backend.
+
+## Quick setup
+
+The base template wires this up for you:
+
+<Steps>
+
+<Step>
+### Set the connection string
+
+```bash title=".env"
+DATABASE_URL=postgres://root:mysecretpassword@localhost:5432/local
+```
+
+You can also split it into discrete vars (`PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DATABASE`) — `pgConnectionUrl(env)` reads either form.
+</Step>
+
+<Step>
+### Boot Postgres
+
+```bash
+pnpm db:start    # docker compose up -d (Postgres + Mailpit)
+```
+
+The `docker-compose.yml` in your project root spins up a Postgres 18 container with the env-driven credentials.
+</Step>
+
+<Step>
+### Push the schema
+
+```bash
+pnpm db:push     # dev — direct schema sync
+# or, for prod:
+pnpm db:generate # produces a SQL migration file
+pnpm db:migrate  # applies it
+```
+
+Drizzle Kit generates migrations into `./drizzle/` with a journal at `drizzle/meta/_journal.json`.
+</Step>
+
+</Steps>
+
+<Callout>
+	On first request after migrations, the CMS hook calls `initializeRLS()` to set up Row-Level Security policies on `cms_documents` and `cms_assets`. You don't need to run anything manually.
+</Callout>
+
+## What the template wires up
+
+`src/lib/server/db/index.ts` is the only file you usually touch — it builds a singleton `DatabaseAdapter` from the Postgres provider and Drizzle schema:
+
+```ts title="src/lib/server/db/index.ts"
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+import { createPostgreSQLProvider, pgConnectionUrl } from '@aphexcms/postgresql-adapter';
+import * as cmsSchema from './cms-schema';
+import * as authSchema from './auth-schema';
+import type { DatabaseAdapter } from '@aphexcms/cms-core/server';
+import { env } from '$env/dynamic/private';
+
+const schema = { ...cmsSchema, ...authSchema };
+
+export const client = postgres(pgConnectionUrl(env), { max: 10 });
+export const drizzleDb = drizzle(client, { schema });
+
+const provider = createPostgreSQLProvider({
+	client,
+	multiTenancy: {
+		enableRLS: true, // database-level isolation (default: true)
+		enableHierarchy: true // parent → child org reads (default: true)
+	}
+});
+
+export const db = provider.createAdapter() as DatabaseAdapter;
+```
+
+The Drizzle instance merges **CMS tables** (documents, assets, schemas, organizations) with **auth tables** (Better Auth users, sessions, accounts). Both schemas live next to it:
+
+<Files>
+	<Folder name="src/lib/server/db" defaultOpen>
+		<File name="index.ts" />
+		<File name="cms-schema.ts" />
+		<File name="auth-schema.ts" />
+	</Folder>
+</Files>
+
+### Connection pooling
+
+The default pool is 10 connections. Tune it for your deployment:
+
+```ts
+export const client = postgres(pgConnectionUrl(env), {
+	max: 10, // serverless: keep small (1–3); long-lived: 10–50
+	idle_timeout: 20
+});
+```
+
+## Multi-tenancy
+
+Aphex stores every document and asset against an `organizationId`. Two layers enforce isolation:
+
+### Row-Level Security (RLS)
+
+Before each query the adapter runs:
+
+```sql
+SET LOCAL app.organization_id = '<uuid>';
+```
+
+The RLS policy then filters rows automatically:
+
+| Operation                  | Behaviour                                                                  |
+| -------------------------- | -------------------------------------------------------------------------- |
+| `SELECT`                   | returns rows from the current org **and** any child organizations          |
+| `INSERT` / `UPDATE` / `DELETE` | only allowed against the current org (parents can't write to children) |
+
+That asymmetry — read down the tree, write only your own — is what enables the parent / child publishing workflows.
+
+### System operations
+
+Background jobs, migrations, and seed scripts use `systemContext()`, which sets `app.override_access = true` and bypasses RLS:
+
+```ts
+import { systemContext } from '@aphexcms/cms-core/server';
+
+const docs = await localAPI.collections.post.find(
+	systemContext('org-id'), // overrideAccess: true
+	{ perspective: 'published' }
+);
+```
+
+### Single-tenant deployments
+
+If you don't need multi-tenancy, disable both flags. RLS still adds about 0.5–1 ms per query — measurable at scale.
+
+```ts
+const provider = createPostgreSQLProvider({
+	client,
+	multiTenancy: {
+		enableRLS: false,
+		enableHierarchy: false
+	}
+});
+```
+
+## Document lifecycle
+
+Documents follow a draft / published model with hash-based change detection:
+
+<Steps>
+
+<Step>
+**Create** — always starts as `status: 'draft'` with `draftData` only.
+</Step>
+
+<Step>
+**Auto-save** — the admin UI saves draft changes every 2 seconds via `updateDocDraft()`.
+</Step>
+
+<Step>
+**Publish** — copies `draftData` to `publishedData`, generates a `publishedHash`, sets `publishedAt`. A new entry is written to `cms_document_versions`.
+</Step>
+
+<Step>
+**Unpublish** — clears `publishedData` and `publishedHash`, reverts to `status: 'draft'`.
+</Step>
+
+<Step>
+**Delete** — permanently removes the document and its version history.
+</Step>
+
+</Steps>
+
+`publishedHash` is a 20-character base36 hash with sorted object keys, so the admin UI can reliably show "you have unpublished changes" without diffing JSON.
+
+## Migrations workflow
+
+```ts title="drizzle.config.ts"
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+	schema: './src/lib/server/db/schema.ts',
+	dialect: 'postgresql',
+	dbCredentials: { url: databaseUrl },
+	verbose: true,
+	strict: true
+});
+```
+
+| Command            | When to use                                                       |
+| ------------------ | ----------------------------------------------------------------- |
+| `pnpm db:generate` | After editing your Drizzle schema. Produces a SQL migration file. |
+| `pnpm db:push`     | **Dev only.** Pushes schema directly without writing a migration. |
+| `pnpm db:migrate`  | **Production.** Applies pending migrations.                       |
+| `pnpm db:studio`   | Opens Drizzle Studio at `localhost:4983` for inspecting tables.   |
+
+For production, always go through `db:generate` → review the SQL → `db:migrate`. `db:push` will happily drop a column without warning.
+
+## Advanced filtering
+
+The adapter translates the `where` syntax in the Local API directly into JSONB operators:
+
+```ts
+const posts = await localAPI.collections.post.find(context, {
+	where: {
+		title: { contains: 'tutorial' },
+		status: { equals: 'published' }
+	},
+	sort: ['-publishedAt'],
+	limit: 10,
+	depth: 1 // resolve one level of references
+});
+```
+
+| Filter             | SQL it produces                                          |
+| ------------------ | -------------------------------------------------------- |
+| `equals`           | `=`                                                      |
+| `contains`         | `ILIKE '%value%'`                                        |
+| `in`               | `= ANY(...)`                                             |
+| `greater_than`     | `>` (numeric / date)                                     |
+| `'a.b': { ... }`   | `data->'a'->>'b'`                                        |
+
+References are resolved recursively up to a configurable `depth` (0–5). At `depth: 0`, references come back as `{ _ref: 'doc-id' }`. At higher depths the referenced document is inlined. Circular references are detected and skipped.
+
+## Table reference
+
+You'll only need this when writing custom adapters or doing direct SQL.
+
+### `cms_documents`
+
+| Column           | Type           | Description                              |
+| ---------------- | -------------- | ---------------------------------------- |
+| `id`             | `uuid`         | Primary key                              |
+| `organizationId` | `uuid`         | Foreign key to `cms_organizations`       |
+| `type`           | `varchar(100)` | Schema name (`post`, `page`, …)          |
+| `status`         | `enum`         | `'draft'` or `'published'`               |
+| `draftData`      | `jsonb`        | Current working version                  |
+| `publishedData`  | `jsonb`        | Live version (`null` until published)    |
+| `publishedHash`  | `varchar(20)`  | Content hash for change detection        |
+| `createdBy`      | `text`         | User ID                                  |
+| `updatedBy`      | `text`         | User ID                                  |
+| `publishedAt`    | `timestamp`    | When last published                      |
+| `createdAt`      | `timestamp`    | Creation time                            |
+| `updatedAt`      | `timestamp`    | Last modification                        |
+
+### `cms_assets`
+
+| Column                                      | Type           | Description                          |
+| ------------------------------------------- | -------------- | ------------------------------------ |
+| `id`                                        | `uuid`         | Primary key                          |
+| `organizationId`                            | `uuid`         | FK to organizations                  |
+| `assetType`                                 | `varchar(20)`  | `'image'` or `'file'`                |
+| `filename`                                  | `varchar(255)` | Generated filename                   |
+| `originalFilename`                          | `varchar(255)` | Original upload name                 |
+| `mimeType`                                  | `varchar(100)` | MIME type                            |
+| `size`                                      | `integer`      | Bytes                                |
+| `url`                                       | `text`         | Public URL                           |
+| `path`                                      | `text`         | Internal storage path                |
+| `storageAdapter`                            | `varchar(50)`  | Adapter that stored the file         |
+| `width`, `height`                           | `integer`      | Image dimensions (`null` for files)  |
+| `metadata`                                  | `jsonb`        | Image metadata (format, color, …)    |
+| `title`, `description`, `alt`, `creditLine` | `text`         | Editor-supplied metadata             |
+
+### Other tables
+
+- **`cms_document_versions`** — version history (one row per draft save / publish). See [Version History](/docs/version-history).
+- **`cms_schema_types`** — registered document and object type definitions (fields stored as JSONB).
+- **`cms_organizations`** — organizations with `parentOrganizationId` for hierarchy.
+- **`cms_organization_members`** — user-to-organization membership with role.
+- **`cms_organization_roles`** — built-in and custom roles per org with capability arrays.
+- **`cms_invitations`** — pending org invitations with token and expiry.
+- **`cms_user_sessions`** — tracks each user's active organization.
+- **`cms_user_profiles`** — CMS-specific user data (instance role, preferences).
+- **`cms_instance_settings`** — single-row instance configuration.
+
+## Custom adapters
+
+Implement `DatabaseAdapter` (a composite of specialized interfaces) and pass the result to `createCMSConfig({ database })`:
+
+```ts
+interface DatabaseAdapter
+	extends
+		DocumentAdapter,
+		AssetAdapter,
+		UserProfileAdapter,
+		SchemaAdapter,
+		OrganizationAdapter,
+		InstanceAdapter {
+	connect?(): Promise<void>;
+	disconnect?(): Promise<void>;
+	isHealthy(): Promise<boolean>;
+
+	// Multi-tenancy (optional)
+	initializeRLS?(): Promise<void>;
+	hierarchyEnabled: boolean;
+	withOrgContext?<T>(organizationId: string, fn: () => Promise<T>): Promise<T>;
+	getChildOrganizations(parentOrganizationId: string): Promise<string[]>;
+
+	// First-user detection
+	hasAnyUserProfiles?(): Promise<boolean>;
+}
+```
+
+Each sub-interface is a focused contract:
+
+| Interface             | Responsibility                                                                     |
+| --------------------- | ---------------------------------------------------------------------------------- |
+| `DocumentAdapter`     | CRUD for documents, publishing, advanced queries with filtering / sorting / pagination |
+| `AssetAdapter`        | CRUD for assets, advanced filtering, reference counting                            |
+| `UserProfileAdapter`  | CMS user profiles (instance role, preferences)                                     |
+| `SchemaAdapter`       | Schema type registration and retrieval                                             |
+| `OrganizationAdapter` | Organizations, members, invitations, user sessions                                 |
+| `InstanceAdapter`     | Instance-level settings                                                            |
+
+The `@aphexcms/postgresql-adapter` source is the reference implementation — clone it as a starting point.
+
+## See also
+
+<Cards>
+	<Card
+		title="Configuration"
+		href="/docs/configuration#database"
+		description="The `database` config option and how it's threaded through the engine."
+	/>
+	<Card
+		title="Storage"
+		href="/docs/storage"
+		description="Pluggable storage for asset uploads — pairs with the database for content."
+	/>
+	<Card
+		title="Access Control"
+		href="/docs/access-control"
+		description="Capabilities, roles, RLS, and how they layer with multi-tenancy."
+	/>
+</Cards>

@@ -1,0 +1,276 @@
+---
+title: Storage
+description: Configure local filesystem or S3-compatible storage for asset uploads. The StorageAdapter interface lives at the bottom for custom-adapter authors.
+icon: HardDrive
+---
+
+Aphex uses a pluggable storage system for file uploads. By default it writes to the local filesystem so you can develop without setting anything up. For production you'll usually swap to S3, R2, or another S3-compatible backend.
+
+## Quick setup
+
+The base template's `src/lib/server/storage/index.ts` picks an adapter at boot from environment variables:
+
+```ts title="src/lib/server/storage/index.ts"
+import { s3Storage } from '@aphexcms/storage-s3';
+import { createStorageAdapter } from '@aphexcms/cms-core/server';
+import { env } from '$env/dynamic/private';
+
+let storageAdapter;
+
+if (env.R2_BUCKET && env.R2_ENDPOINT && env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY) {
+	storageAdapter = s3Storage({
+		bucket: env.R2_BUCKET,
+		endpoint: env.R2_ENDPOINT,
+		accessKeyId: env.R2_ACCESS_KEY_ID,
+		secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+		publicUrl: env.R2_PUBLIC_URL || ''
+	}).adapter;
+} else {
+	storageAdapter = createStorageAdapter('local', {
+		basePath: './static/uploads',
+		baseUrl: '/uploads'
+	});
+}
+
+export { storageAdapter };
+```
+
+<Tabs items={['Dev (local)', 'Prod (R2 / S3)']}>
+
+<Tab value="Dev (local)">
+
+Leave the `R2_*` vars empty in `.env`. Files land in `./static/uploads/` and are served by SvelteKit's static handler at `/uploads/...`. Restart not required after upload.
+</Tab>
+
+<Tab value="Prod (R2 / S3)">
+
+```bash title=".env"
+R2_BUCKET=my-bucket
+R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+R2_PUBLIC_URL=https://cdn.your-app.com
+```
+
+Filenames get a timestamp + random suffix. The CMS skips its built-in local adapter when an S3 helper returns `disableLocalStorage: true`.
+</Tab>
+
+</Tabs>
+
+## Default local adapter
+
+When you omit the `storage` option from `createCMSConfig` entirely, Aphex spins up its **own** local adapter — different from the template's:
+
+| Property            | Default local (no template)            | Template's `static/uploads` adapter |
+| ------------------- | -------------------------------------- | ----------------------------------- |
+| Storage path        | `./storage/assets` (private)           | `./static/uploads`                  |
+| Serving path        | `/media/{id}/{filename}` (CMS handler) | `/uploads/...` (SvelteKit static)   |
+| Access control      | yes — passes through `assetService`    | none — anyone with the URL          |
+| Cache-Control       | `max-age=31536000` (1y)                | SvelteKit defaults                  |
+| Max file size       | 10 MB                                  | configurable                        |
+| Allowed MIME types  | jpg / png / webp / gif / avif / pdf / text | configurable                    |
+
+If you want the access-controlled `/media/...` serving without the template's pass-through, just delete the conditional in `src/lib/server/storage/index.ts` and don't set `storage` on the config at all.
+
+## Switching to S3
+
+```bash
+pnpm add @aphexcms/storage-s3
+```
+
+`s3Storage()` returns `{ adapter, disableLocalStorage: true }` so you can plug it straight into the config:
+
+```ts title="aphex.config.ts"
+import { s3Storage } from '@aphexcms/storage-s3';
+import { env } from '$env/dynamic/private';
+
+const storage = s3Storage({
+	bucket: env.R2_BUCKET,
+	endpoint: env.R2_ENDPOINT,
+	accessKeyId: env.R2_ACCESS_KEY_ID,
+	secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+	publicUrl: env.R2_PUBLIC_URL
+});
+
+export default createCMSConfig({
+	storage
+	// ...
+});
+```
+
+### Options
+
+<TypeTable
+	type={{
+		bucket: { type: 'string', description: 'S3 bucket name. Required.' },
+		endpoint: { type: 'string', description: 'S3 endpoint URL. Required.' },
+		accessKeyId: { type: 'string', description: 'API access key ID. Required.' },
+		secretAccessKey: { type: 'string', description: 'API secret access key. Required.' },
+		region: { type: 'string', default: "'auto'", description: 'AWS region. R2 uses `auto`.' },
+		publicUrl: { type: 'string', description: 'CDN URL for serving files. Defaults to `endpoint`.' },
+		basePath: { type: 'string', default: "''", description: 'Path prefix for organizing files within the bucket.' },
+		maxFileSize: { type: 'number', default: '10485760', description: 'Max upload size in bytes (default 10 MB).' },
+		allowedTypes: { type: 'string[]', description: 'Allowed MIME types. Defaults to common image types.' }
+	}}
+/>
+
+### Provider snippets
+
+<Tabs items={['Cloudflare R2', 'AWS S3', 'MinIO']}>
+
+<Tab value="Cloudflare R2">
+
+```ts
+s3Storage({
+	bucket: env.R2_BUCKET,
+	endpoint: env.R2_ENDPOINT, // https://<account>.r2.cloudflarestorage.com
+	accessKeyId: env.R2_ACCESS_KEY_ID,
+	secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+	publicUrl: env.R2_PUBLIC_URL // your cdn / public bucket URL
+});
+```
+</Tab>
+
+<Tab value="AWS S3">
+
+```ts
+s3Storage({
+	bucket: 'my-bucket',
+	endpoint: 'https://s3.us-east-1.amazonaws.com',
+	accessKeyId: env.AWS_ACCESS_KEY_ID,
+	secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+	region: 'us-east-1'
+});
+```
+</Tab>
+
+<Tab value="MinIO">
+
+```ts
+s3Storage({
+	bucket: 'my-bucket',
+	endpoint: 'http://localhost:9000',
+	accessKeyId: 'minioadmin',
+	secretAccessKey: 'minioadmin'
+});
+```
+</Tab>
+
+</Tabs>
+
+## Upload flow
+
+When a file is uploaded via the admin UI or `POST /api/assets`:
+
+<Steps>
+
+<Step>
+**Validation** — MIME type and size are checked against the adapter's limits before anything touches disk.
+</Step>
+
+<Step>
+**Image metadata extraction** — for images, [Sharp](https://sharp.pixelplumbing.com/) extracts width, height, format, color space, dominant color, and ICC profile presence.
+</Step>
+
+<Step>
+**Storage** — the file is stored via the adapter. S3 helpers generate unique filenames with a timestamp and random suffix.
+</Step>
+
+<Step>
+**Database record** — an asset row lands in `cms_assets` with the metadata, storage path, and adapter name. If the database write fails, the storage write is rolled back.
+</Step>
+
+<Step>
+**URL generation** — local storage gets a `/media/{id}/{filename}` URL (access-controlled). S3 returns its own public URL.
+</Step>
+
+</Steps>
+
+## Image metadata
+
+Sharp extracts the following on image upload:
+
+| Field           | Description                              |
+| --------------- | ---------------------------------------- |
+| `width`         | Width in pixels                          |
+| `height`        | Height in pixels                         |
+| `format`        | Image format (`jpeg`, `png`, `webp`, …)  |
+| `space`         | Color space (`srgb`, `rgb`, …)           |
+| `channels`      | Number of color channels                 |
+| `density`       | DPI if available                         |
+| `hasProfile`    | Whether an ICC color profile is embedded |
+| `hasAlpha`      | Whether the image has transparency       |
+| `dominantColor` | Dominant RGB color                       |
+
+Stored in the asset's `metadata` JSONB column.
+
+## Asset access control
+
+Assets served through the CDN route `/media/[id]/[filename]` go through the same auth + capability stack as documents:
+
+- **Public assets** — served without authentication.
+- **Private assets** — fields marked `private: true` in your schema require an authenticated session.
+- **Organization isolation** — assets respect the same multi-tenant rules as documents. Parent orgs can read child org assets.
+
+For S3 storage with a public URL, assets bypass the CDN route entirely and are served directly from the S3 endpoint — keep that in mind if you need access control on every read.
+
+## Adapter tracking and migrations
+
+Each asset row stores which `storageAdapter` was used (e.g. `'local'` or `'s3'`). This enables:
+
+- **Safe migrations** — move from local to S3 without breaking existing assets. Old files keep working through the local adapter while new ones flow into S3.
+- **Adapter mismatch warnings** — deleting an asset stored by a different adapter logs a warning rather than silently dropping the row.
+- **Mixed storage** — older assets on local storage continue to work after switching backends.
+
+## Custom adapters
+
+Implement the `StorageAdapter` interface and pass the result to `createCMSConfig({ storage })`. Most users will never need to do this — start with the S3 helper unless you're integrating an unusual backend.
+
+```ts
+interface StorageAdapter {
+	readonly name: string;
+
+	// Core operations (required)
+	store(data: UploadFileData): Promise<StorageFile>;
+	delete(path: string): Promise<boolean>;
+	exists(path: string): Promise<boolean>;
+	getUrl(path: string): string;
+
+	// Info and health
+	getStorageInfo(): Promise<{ totalSize: number; availableSpace?: number }>;
+	isHealthy(): Promise<boolean>;
+
+	// Connection lifecycle (optional)
+	connect?(): Promise<void>;
+	disconnect?(): Promise<void>;
+
+	// Extended operations (optional — enable file serving, admin browsing, signed URLs)
+	getObject?(path: string): Promise<Buffer>;
+	listObjects?(options?: ListObjectsOptions): Promise<ListObjectsResult>;
+	copyObject?(sourcePath: string, destPath: string): Promise<boolean>;
+	getObjectMetadata?(path: string): Promise<StorageObjectMetadata>;
+	getSignedUrl?(path: string, expiresIn?: number): Promise<string>;
+}
+```
+
+The `name` field identifies which adapter stored each file in `cms_assets.storageAdapter`, so it must be unique per backend. Implementing only the required six methods gives you upload + delete + exists + URL generation; the optional methods unlock features like in-app file browsing and pre-signed URLs.
+
+## See also
+
+<Cards>
+	<Card
+		title="Configuration"
+		href="/docs/configuration#storage"
+		description="The `storage` config option and where the engine wires it in."
+	/>
+	<Card
+		title="HTTP API"
+		href="/docs/http-api#assets"
+		description="Asset endpoints — upload, list, update metadata, delete."
+	/>
+	<Card
+		title="Database"
+		href="/docs/database"
+		description="Where the asset rows live and how multi-tenancy works."
+	/>
+</Cards>
